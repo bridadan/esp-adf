@@ -66,7 +66,7 @@ extern "C" {
 #define TOUCH_VOLDWN                TOUCH_PAD_NUM4
 
 /* I2S gpios */
-#define IIS_SCLK                    5
+#define IIS_SCLK                    14
 #define IIS_LCLK                    25
 #define IIS_DSIN                    26
 #define IIS_DOUT                    35
