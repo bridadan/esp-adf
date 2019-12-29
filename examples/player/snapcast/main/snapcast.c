@@ -30,7 +30,7 @@
 #include "i2s_stream.h"
 #include "flac_decoder.h"
 #include "audio_hal.h"
-#include "filter_resample.h"
+#include "raw_stream.h"
 
 #include "snapcast.h"
 
@@ -59,8 +59,8 @@ static EventGroupHandle_t wifi_event_group;
    to the AP with an IP? */
 const int CONNECTED_BIT = BIT0;
 
-
 static char buff[BUFF_LEN];
+static audio_element_handle_t snapcast_stream;
 
 int flac_music_read_cb(audio_element_handle_t el, char *buf, int len, TickType_t wait_time, void *ctx)
 {
@@ -218,8 +218,15 @@ static void http_get_task(void *pvParameters)
 						return;
 					}
 
-					// TODO push this to buffer
 					ESP_LOGI(TAG, "Received codec header message\r\n");
+                    size = codec_header_message.size;
+                    start = codec_header_message.payload;
+
+                    while (size > 0) {
+                        result = raw_stream_write(snapcast_stream, start, size);
+                        start += result; // TODO pointer arithmetic is bad maybe?
+                        size -= result;
+                    }
 
 					codec_header_message_free(&codec_header_message);
 					received_header = true;
@@ -236,8 +243,15 @@ static void http_get_task(void *pvParameters)
 						return;
 					}
 
-					// TODO push this to buffer
 					ESP_LOGI(TAG, "Received wire message\r\n");
+                    size = wire_chunk_message.size;
+                    start = wire_chunk_message.payload;
+
+                    while (size > 0) {
+                        result = raw_stream_write(snapcast_stream, start, size);
+                        start += result; // TODO pointer arithmetic is bad maybe?
+                        size -= result;
+                    }
 					
 					wire_chunk_message_free(&wire_chunk_message);
 				break;
@@ -256,9 +270,6 @@ static void http_get_task(void *pvParameters)
 
 void app_main(void)
 {
-    initialise_wifi();
-    xTaskCreate(&http_get_task, "http_get_task", 4096, NULL, 5, NULL);
-
     audio_pipeline_handle_t pipeline;
     audio_element_handle_t i2s_stream_writer, flac_decoder;
     esp_log_level_set("*", ESP_LOG_WARN);
@@ -274,23 +285,29 @@ void app_main(void)
     pipeline = audio_pipeline_init(&pipeline_cfg);
     mem_assert(pipeline);
 
-    ESP_LOGI(TAG, "[2.1] Create flac decoder to decode flac file and set custom read callback");
+    ESP_LOGI(TAG, "[2.1] Create snapcast stream");
+    raw_stream_cfg_t snapcast_stream_cfg;
+    snapcast_stream_cfg.type = AUDIO_STREAM_WRITER; 
+    snapcast_stream_cfg.out_rb_size = 8 * 1024;
+    snapcast_stream = raw_stream_init(&snapcast_stream_cfg);
+
+    ESP_LOGI(TAG, "[2.2] Create flac decoder to decode flac file and set custom read callback");
     flac_decoder_cfg_t flac_cfg = DEFAULT_FLAC_DECODER_CONFIG();
     flac_decoder = flac_decoder_init(&flac_cfg);
-    audio_element_set_read_cb(flac_decoder, flac_music_read_cb, NULL);
 
-    ESP_LOGI(TAG, "[2.2] Create i2s stream to write data to codec chip");
+    ESP_LOGI(TAG, "[2.3] Create i2s stream to write data to codec chip");
     i2s_stream_cfg_t i2s_cfg = I2S_STREAM_CFG_DEFAULT();
     i2s_cfg.type = AUDIO_STREAM_WRITER;
     i2s_cfg.i2s_config.sample_rate = 48000;
     i2s_stream_writer = i2s_stream_init(&i2s_cfg);
 
-    ESP_LOGI(TAG, "[2.3] Register all elements to audio pipeline");
+    ESP_LOGI(TAG, "[2.4] Register all elements to audio pipeline");
+    audio_pipeline_register(pipeline, snapcast_stream, "snapcast");
     audio_pipeline_register(pipeline, flac_decoder, "flac");
     audio_pipeline_register(pipeline, i2s_stream_writer, "i2s");
 
-    ESP_LOGI(TAG, "[2.4] Link it together [flac_music_read_cb]-->flac_decoder-->i2s_stream-->[codec_chip]");
-    audio_pipeline_link(pipeline, (const char *[]) {"flac", "i2s"}, 2);
+    ESP_LOGI(TAG, "[2.5] Link it together snapcast-->flac_decoder-->i2s_stream-->[codec_chip]");
+    audio_pipeline_link(pipeline, (const char *[]) {"snapcast", "flac", "i2s"}, 3);
 
     ESP_LOGI(TAG, "[ 3 ] Setup event listener");
     audio_event_iface_cfg_t evt_cfg = AUDIO_EVENT_IFACE_DEFAULT_CFG();
@@ -301,6 +318,9 @@ void app_main(void)
 
     ESP_LOGI(TAG, "[ 4 ] Start audio_pipeline");
     audio_pipeline_run(pipeline);
+
+    initialise_wifi();
+    xTaskCreate(&http_get_task, "http_get_task", 4096, NULL, 5, NULL);
 
     while (1) {
         audio_event_iface_msg_t msg;
