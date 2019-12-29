@@ -32,6 +32,8 @@
 #include "audio_hal.h"
 #include "filter_resample.h"
 
+#include "snapcast.h"
+
 /* The examples use simple WiFi configuration that you can set via
    'make menuconfig'.
 
@@ -42,9 +44,9 @@
 #define EXAMPLE_WIFI_PASS CONFIG_WIFI_PASSWORD
 
 /* Constants that aren't configurable in menuconfig */
-#define WEB_SERVER "example.com"
-#define WEB_PORT 80
-#define WEB_URL "http://example.com/"
+#define HOST "192.168.1.141"
+#define PORT 1704
+#define BUFF_LEN 6000
 
 /* Logging tag */
 static const char *TAG = "SNAPCAST";
@@ -57,10 +59,8 @@ static EventGroupHandle_t wifi_event_group;
    to the AP with an IP? */
 const int CONNECTED_BIT = BIT0;
 
-static const char *REQUEST = "GET " WEB_URL " HTTP/1.0\r\n"
-    "Host: "WEB_SERVER"\r\n"
-    "User-Agent: esp-idf/1.0 esp32\r\n"
-    "\r\n";
+
+static char buff[BUFF_LEN];
 
 int flac_music_read_cb(audio_element_handle_t el, char *buf, int len, TickType_t wait_time, void *ctx)
 {
@@ -110,14 +110,12 @@ static void initialise_wifi(void)
 
 static void http_get_task(void *pvParameters)
 {
-    const struct addrinfo hints = {
-        .ai_family = AF_INET,
-        .ai_socktype = SOCK_STREAM,
-    };
-    struct addrinfo *res;
-    struct in_addr *addr;
-    int s, r;
-    char recv_buf[64];
+    struct sockaddr_in servaddr;
+	char *start;
+	int sockfd;
+	char base_message_serialized[BASE_MESSAGE_SIZE];
+	char *hello_message_serialized;
+	int result, size;
 
     while(1) {
         /* Wait for the callback to set the CONNECTED_BIT in the
@@ -127,71 +125,127 @@ static void http_get_task(void *pvParameters)
                             false, true, portMAX_DELAY);
         ESP_LOGI(TAG, "Connected to AP");
 
-        int err = getaddrinfo(WEB_SERVER, "80", &hints, &res);
+		servaddr.sin_family = AF_INET;
+		servaddr.sin_addr.s_addr = inet_addr(HOST);
+		servaddr.sin_port = htons(PORT);
 
-        if(err != 0 || res == NULL) {
-            ESP_LOGE(TAG, "DNS lookup failed err=%d res=%p", err, res);
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
-            continue;
-        }
-
-        /* Code to print the resolved IP.
-
-           Note: inet_ntoa is non-reentrant, look at ipaddr_ntoa_r for "real" code */
-        addr = &((struct sockaddr_in *)res->ai_addr)->sin_addr;
-        ESP_LOGI(TAG, "DNS lookup succeeded. IP=%s", inet_ntoa(*addr));
-
-        s = socket(res->ai_family, res->ai_socktype, 0);
-        if(s < 0) {
+        sockfd = socket(AF_INET, SOCK_STREAM, 0);
+        if(sockfd < 0) {
             ESP_LOGE(TAG, "... Failed to allocate socket.");
-            freeaddrinfo(res);
             vTaskDelay(1000 / portTICK_PERIOD_MS);
             continue;
         }
         ESP_LOGI(TAG, "... allocated socket");
 
-        if(connect(s, res->ai_addr, res->ai_addrlen) != 0) {
+		if (connect(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) != 0) {
             ESP_LOGE(TAG, "... socket connect failed errno=%d", errno);
-            close(s);
-            freeaddrinfo(res);
+            close(sockfd);
             vTaskDelay(4000 / portTICK_PERIOD_MS);
             continue;
         }
 
         ESP_LOGI(TAG, "... connected");
-        freeaddrinfo(res);
 
-        if (write(s, REQUEST, strlen(REQUEST)) < 0) {
-            ESP_LOGE(TAG, "... socket send failed");
-            close(s);
-            vTaskDelay(4000 / portTICK_PERIOD_MS);
-            continue;
-        }
-        ESP_LOGI(TAG, "... socket send success");
+		codec_header_message_t codec_header_message;
+		wire_chunk_message_t wire_chunk_message;
+		
+		bool received_header = false;
+		base_message_t base_message = {
+			hello,
+			0x0,
+			0x0,
+			{ 0x5df65146, 0x0 },
+			{ 0x5df65146, 0x0 },
+			0x0,
+		};
 
-        struct timeval receiving_timeout;
-        receiving_timeout.tv_sec = 5;
-        receiving_timeout.tv_usec = 0;
-        if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &receiving_timeout,
-                sizeof(receiving_timeout)) < 0) {
-            ESP_LOGE(TAG, "... failed to set socket receiving timeout");
-            close(s);
-            vTaskDelay(4000 / portTICK_PERIOD_MS);
-            continue;
-        }
-        ESP_LOGI(TAG, "... set socket receiving timeout success");
+		hello_message_t hello_message = {
+			"0c:8b:fd:d0:e4:d1",
+			"ESP32-Caster",
+			"0.0.0",
+			"libsnapcast",
+			"esp32",
+			"xtensa",
+			1,
+			"0c:8b:fd:d0:e4:d1",
+			2,
+		};
 
-        /* Read HTTP response */
-        do {
-            bzero(recv_buf, sizeof(recv_buf));
-            r = read(s, recv_buf, sizeof(recv_buf)-1);
-            for(int i = 0; i < r; i++) {
-                putchar(recv_buf[i]);
-            }
-        } while(r > 0);
+		hello_message_serialized = hello_message_serialize(&hello_message, (size_t*) &(base_message.size));
+		if (!hello_message_serialized) {
+			ESP_LOGI(TAG, "Failed to serialize hello message\r\b");
+			return;
+		}
 
-        ESP_LOGI(TAG, "... done reading from socket. Last read return=%d errno=%d\r\n", r, errno);
-        close(s);
+		result = base_message_serialize(
+			&base_message,
+			base_message_serialized,
+			BASE_MESSAGE_SIZE
+		);
+		if (result) {
+			ESP_LOGI(TAG, "Failed to serialize base message\r\n");
+			return;
+		}
+
+		write(sockfd, base_message_serialized, BASE_MESSAGE_SIZE);
+		write(sockfd, hello_message_serialized, base_message.size);
+		free(hello_message_serialized);
+
+		for (;;) {
+			size = read(sockfd, buff, BUFF_LEN);
+			if (size < 0) {
+				ESP_LOGI(TAG, "Failed to read from server: %d\r\n", size);
+				return;
+			}
+
+			result = base_message_deserialize(&base_message, buff, size);
+			if (result) {
+				ESP_LOGI(TAG, "Failed to read base message: %d\r\n", result);
+				// TODO there should be a big circular buffer or something for this
+				return;
+			}
+
+			start = &(buff[BASE_MESSAGE_SIZE]);
+			size -= BASE_MESSAGE_SIZE;
+			///print_buffer(start, size);
+			///ESP_LOGI(TAG, "\r\n");
+
+			switch (base_message.type) {
+				case codec_header:
+					result = codec_header_message_deserialize(&codec_header_message, start, size);
+					if (result) {
+						ESP_LOGI(TAG, "Failed to read codec header: %d\r\n", result);
+						return;
+					}
+
+					// TODO push this to buffer
+					ESP_LOGI(TAG, "Received codec header message\r\n");
+
+					codec_header_message_free(&codec_header_message);
+					received_header = true;
+				break;
+				
+				case wire_chunk:
+					if (!received_header) {
+						continue;
+					}
+
+					result = wire_chunk_message_deserialize(&wire_chunk_message, start, size);
+					if (result) {
+						ESP_LOGI(TAG, "Failed to read wire chunk: %d\r\n", result);
+						return;
+					}
+
+					// TODO push this to buffer
+					ESP_LOGI(TAG, "Received wire message\r\n");
+					
+					wire_chunk_message_free(&wire_chunk_message);
+				break;
+			}
+		}
+        
+		ESP_LOGI(TAG, "... done reading from socket\r\n");
+        close(sockfd);
         for(int countdown = 10; countdown >= 0; countdown--) {
             ESP_LOGI(TAG, "%d... ", countdown);
             vTaskDelay(1000 / portTICK_PERIOD_MS);
