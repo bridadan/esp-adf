@@ -44,7 +44,7 @@
 #define EXAMPLE_WIFI_PASS CONFIG_WIFI_PASSWORD
 
 /* Constants that aren't configurable in menuconfig */
-#define HOST "192.168.1.141"
+#define HOST "192.168.1.148"
 #define PORT 1704
 #define BUFF_LEN 6000
 
@@ -148,7 +148,7 @@ static void http_get_task(void *pvParameters)
 
 		codec_header_message_t codec_header_message;
 		wire_chunk_message_t wire_chunk_message;
-		
+
 		bool received_header = false;
 		base_message_t base_message = {
 			hello,
@@ -192,11 +192,16 @@ static void http_get_task(void *pvParameters)
 		free(hello_message_serialized);
 
 		for (;;) {
-			size = read(sockfd, buff, BUFF_LEN);
-			if (size < 0) {
-				ESP_LOGI(TAG, "Failed to read from server: %d\r\n", size);
-				return;
-			}
+            size = 0;
+            while (size < BASE_MESSAGE_SIZE) {
+                result = read(sockfd, &(buff[size]), BASE_MESSAGE_SIZE - size);
+                if (result < 0) {
+                    ESP_LOGI(TAG, "Failed to read from server: %d\r\n", result);
+                    return;
+                }
+
+                size += result;
+            }
 
 			result = base_message_deserialize(&base_message, buff, size);
 			if (result) {
@@ -205,8 +210,17 @@ static void http_get_task(void *pvParameters)
 				return;
 			}
 
-			start = &(buff[BASE_MESSAGE_SIZE]);
-			size -= BASE_MESSAGE_SIZE;
+            start = buff;
+            size = 0;
+            while (size < base_message.size) {
+                result = read(sockfd, &(buff[size]), base_message.size - size);
+                if (result < 0) {
+                    ESP_LOGI(TAG, "Failed to read from server: %d\r\n", result);
+                    return;
+                }
+
+                size += result;
+            }
 			///print_buffer(start, size);
 			///ESP_LOGI(TAG, "\r\n");
 
@@ -218,7 +232,7 @@ static void http_get_task(void *pvParameters)
 						return;
 					}
 
-					ESP_LOGI(TAG, "Received codec header message\r\n");
+					//ESP_LOGI(TAG, "Received codec header message\r\n");
                     size = codec_header_message.size;
                     start = codec_header_message.payload;
 
@@ -231,7 +245,7 @@ static void http_get_task(void *pvParameters)
 					codec_header_message_free(&codec_header_message);
 					received_header = true;
 				break;
-				
+
 				case wire_chunk:
 					if (!received_header) {
 						continue;
@@ -243,7 +257,7 @@ static void http_get_task(void *pvParameters)
 						return;
 					}
 
-					ESP_LOGI(TAG, "Received wire message\r\n");
+					//ESP_LOGI(TAG, "Received wire message\r\n");
                     size = wire_chunk_message.size;
                     start = wire_chunk_message.payload;
 
@@ -252,12 +266,12 @@ static void http_get_task(void *pvParameters)
                         start += result; // TODO pointer arithmetic is bad maybe?
                         size -= result;
                     }
-					
+
 					wire_chunk_message_free(&wire_chunk_message);
 				break;
 			}
 		}
-        
+
 		ESP_LOGI(TAG, "... done reading from socket\r\n");
         close(sockfd);
         for(int countdown = 10; countdown >= 0; countdown--) {
@@ -275,7 +289,7 @@ void app_main(void)
     esp_log_level_set("*", ESP_LOG_WARN);
     esp_log_level_set(TAG, ESP_LOG_INFO);
     ESP_LOGI(TAG, "[ 1 ] Start audio codec chip");
-    
+
     audio_hal_codec_config_t audio_hal_codec_cfg = AUDIO_HAL_ES8388_DEFAULT();
     audio_hal_handle_t hal = audio_hal_init(&audio_hal_codec_cfg, 0);
     audio_hal_ctrl_codec(hal, AUDIO_HAL_CODEC_MODE_DECODE, AUDIO_HAL_CTRL_START);
@@ -287,7 +301,7 @@ void app_main(void)
 
     ESP_LOGI(TAG, "[2.1] Create snapcast stream");
     raw_stream_cfg_t snapcast_stream_cfg;
-    snapcast_stream_cfg.type = AUDIO_STREAM_WRITER; 
+    snapcast_stream_cfg.type = AUDIO_STREAM_WRITER;
     snapcast_stream_cfg.out_rb_size = 8 * 1024;
     snapcast_stream = raw_stream_init(&snapcast_stream_cfg);
 
@@ -298,7 +312,7 @@ void app_main(void)
     ESP_LOGI(TAG, "[2.3] Create i2s stream to write data to codec chip");
     i2s_stream_cfg_t i2s_cfg = I2S_STREAM_CFG_DEFAULT();
     i2s_cfg.type = AUDIO_STREAM_WRITER;
-    i2s_cfg.i2s_config.sample_rate = 48000;
+    i2s_cfg.i2s_config.sample_rate = 44100;
     i2s_stream_writer = i2s_stream_init(&i2s_cfg);
 
     ESP_LOGI(TAG, "[2.4] Register all elements to audio pipeline");
@@ -320,7 +334,7 @@ void app_main(void)
     audio_pipeline_run(pipeline);
 
     initialise_wifi();
-    xTaskCreate(&http_get_task, "http_get_task", 4096, NULL, 5, NULL);
+    xTaskCreatePinnedToCore(&http_get_task, "http_get_task", 4096, NULL, 5, NULL, 1);
 
     while (1) {
         audio_event_iface_msg_t msg;
