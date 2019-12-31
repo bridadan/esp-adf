@@ -6,7 +6,7 @@
 	url = https://github.com/espressif/esp-adf-libs
 [submodule "components/snapcast/libsnapcast"]
 	path = components/snapcast/libsnapcast
-	url = /home/bridadan/dev/snapcast_protocol/libsnapcast/
+	url = https://github.com/bridadan/libsnapcast
 [submodule "components/snapcast/libbuffer"]
 	path = components/snapcast/libbuffer
-	url = /home/bridadan/dev/libbuffer/
+	url = https://github.com/bridadan/libbuffer
