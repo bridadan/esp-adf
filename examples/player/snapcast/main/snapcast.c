@@ -50,6 +50,7 @@
 #define HOST "192.168.1.148"
 #define PORT 1704
 #define BUFF_LEN 6000
+#define ENVELOPE_FILTER_BUFFER_SIZE (1764)
 
 /* Logging tag */
 static const char *TAG = "SNAPCAST";
@@ -65,6 +66,79 @@ const int CONNECTED_BIT = BIT0;
 static char buff[BUFF_LEN];
 static audio_element_handle_t snapcast_stream;
 static char mac_address[18];
+
+static esp_err_t envelope_filter_destroy(audio_element_handle_t self) {
+    return ESP_OK;
+}
+
+static esp_err_t envelope_filter_open(audio_element_handle_t self) {
+    return ESP_OK;
+}
+
+static esp_err_t envelope_filter_close(audio_element_handle_t self) {
+  if (audio_element_get_state(self) != AEL_STATE_PAUSED) {
+    audio_element_info_t info = {0};
+    audio_element_getinfo(self, &info);
+    info.byte_pos = 0;
+    audio_element_setinfo(self, &info);
+  }
+
+  return ESP_OK;
+}
+
+static double current_volume = 0.5;
+
+static void apply_envelope(void *buffer, int size) {
+  // assume 16 bit samples:
+  int16_t *samples = buffer;
+  size_t count = size / 2;
+
+  for (size_t i = 0; i < count; i++) {
+    samples[i] = samples[i] * current_volume;
+  }
+}
+
+static int envelope_filter_process(audio_element_handle_t self, char *buffer, int size) {
+  audio_element_info_t info = { 0 };
+  audio_element_getinfo(self, &info);
+
+  int size_read = audio_element_input(self, buffer, size);
+  int result = size_read; // Could be negative error code
+
+  if (size_read > 0) {
+    apply_envelope(buffer, size_read);
+    int size_write = audio_element_output(self, buffer, size_read);
+    if (size_write > 0) {
+      info.byte_pos += size_write;
+    }
+    result = size_write;
+  }
+
+  audio_element_setinfo(self, &info);
+  return result;
+}
+
+audio_element_handle_t create_envelope_filter() {
+  audio_element_cfg_t cfg = DEFAULT_AUDIO_ELEMENT_CONFIG();
+
+  cfg.process = envelope_filter_process;
+  cfg.open = envelope_filter_open;
+  cfg.close = envelope_filter_close;
+  cfg.destroy = envelope_filter_destroy;
+
+  cfg.buffer_len = ENVELOPE_FILTER_BUFFER_SIZE;
+
+  cfg.tag = "volume";
+  cfg.task_prio = 5;
+  cfg.task_core = 0;
+  cfg.out_rb_size = 3 * ENVELOPE_FILTER_BUFFER_SIZE;
+  audio_element_handle_t el = audio_element_init(&cfg);
+  mem_assert(el);
+  audio_element_info_t info = {0};
+  audio_element_setinfo(el, &info);
+
+  return el;
+}
 
 int flac_music_read_cb(audio_element_handle_t el, char *buf, int len, TickType_t wait_time, void *ctx)
 {
@@ -153,6 +227,7 @@ static void http_get_task(void *pvParameters)
 
         codec_header_message_t codec_header_message;
         wire_chunk_message_t wire_chunk_message;
+        server_settings_message_t server_settings_message;
 
         result = gettimeofday(&tv, NULL);
         if (result) {
@@ -289,6 +364,22 @@ static void http_get_task(void *pvParameters)
 
                     wire_chunk_message_free(&wire_chunk_message);
                 break;
+
+                case SNAPCAST_MESSAGE_SERVER_SETTINGS:
+                    // The first 4 bytes in the buffer are the size of the string.
+                    // We don't need this, so we'll shift the entire buffer over 4 bytes
+                    // and use the extra room to add a null character so cJSON can pares it.
+                    memmove(start, start + 4, size - 4);
+                    start[size - 3] = '\0';
+                    result = server_settings_message_deserialize(&server_settings_message, start);
+                    if (result) {
+                        ESP_LOGI(TAG, "Failed to read server settings: %d\r\n", result);
+                        return;
+                    }
+
+                    ESP_LOGI(TAG, "Setting volume: %d", server_settings_message.volume);
+                    current_volume = server_settings_message.volume / 100.0;
+                break;
             }
         }
 
@@ -338,7 +429,7 @@ void app_main(void)
     sprintf(mac_address, "%02X:%02X:%02X:%02X:%02X:%02X", base_mac[0], base_mac[1], base_mac[2], base_mac[3], base_mac[4], base_mac[5]);
 
     audio_pipeline_handle_t pipeline;
-    audio_element_handle_t i2s_stream_writer, flac_decoder;
+    audio_element_handle_t i2s_stream_writer, flac_decoder, volume;
     esp_log_level_set("*", ESP_LOG_WARN);
     esp_log_level_set(TAG, ESP_LOG_INFO);
     ESP_LOGI(TAG, "[ 1 ] Start audio codec chip");
@@ -358,23 +449,27 @@ void app_main(void)
     snapcast_stream_cfg.out_rb_size = 8 * 1024;
     snapcast_stream = raw_stream_init(&snapcast_stream_cfg);
 
-    ESP_LOGI(TAG, "[2.2] Create flac decoder to decode flac file and set custom read callback");
+    ESP_LOGI(TAG, "[2.2] Create flac decoder to decode flac file");
     flac_decoder_cfg_t flac_cfg = DEFAULT_FLAC_DECODER_CONFIG();
     flac_decoder = flac_decoder_init(&flac_cfg);
 
-    ESP_LOGI(TAG, "[2.3] Create i2s stream to write data to codec chip");
+    ESP_LOGI(TAG, "[2.3] Create volume filter");
+    volume = create_envelope_filter();
+
+    ESP_LOGI(TAG, "[2.4] Create i2s stream to write data to codec chip");
     i2s_stream_cfg_t i2s_cfg = I2S_STREAM_CFG_DEFAULT();
     i2s_cfg.type = AUDIO_STREAM_WRITER;
     i2s_cfg.i2s_config.sample_rate = 44100;
     i2s_stream_writer = i2s_stream_init(&i2s_cfg);
 
-    ESP_LOGI(TAG, "[2.4] Register all elements to audio pipeline");
+    ESP_LOGI(TAG, "[2.5] Register all elements to audio pipeline");
     audio_pipeline_register(pipeline, snapcast_stream, "snapcast");
     audio_pipeline_register(pipeline, flac_decoder, "flac");
+    audio_pipeline_register(pipeline, volume, "volume");
     audio_pipeline_register(pipeline, i2s_stream_writer, "i2s");
 
-    ESP_LOGI(TAG, "[2.5] Link it together snapcast-->flac_decoder-->i2s_stream-->[codec_chip]");
-    audio_pipeline_link(pipeline, (const char *[]) {"snapcast", "flac", "i2s"}, 3);
+    ESP_LOGI(TAG, "[2.6] Link it together snapcast-->flac_decoder-->volume-->i2s_stream-->[codec_chip]");
+    audio_pipeline_link(pipeline, (const char *[]) {"snapcast", "flac", "volume", "i2s"}, 4);
 
     ESP_LOGI(TAG, "[ 3 ] Setup event listener");
     audio_event_iface_cfg_t evt_cfg = AUDIO_EVENT_IFACE_DEFAULT_CFG();
