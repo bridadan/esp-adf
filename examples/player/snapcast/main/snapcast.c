@@ -61,6 +61,7 @@ const int CONNECTED_BIT = BIT0;
 
 static char buff[BUFF_LEN];
 static audio_element_handle_t snapcast_stream;
+static char mac_address[18];
 
 int flac_music_read_cb(audio_element_handle_t el, char *buf, int len, TickType_t wait_time, void *ctx)
 {
@@ -160,14 +161,14 @@ static void http_get_task(void *pvParameters)
 		};
 
 		hello_message_t hello_message = {
-			"0c:8b:fd:d0:e4:d1",
+			mac_address,
 			"ESP32-Caster",
 			"0.0.0",
 			"libsnapcast",
 			"esp32",
 			"xtensa",
 			1,
-			"0c:8b:fd:d0:e4:d1",
+			mac_address,
 			2,
 		};
 
@@ -284,6 +285,11 @@ static void http_get_task(void *pvParameters)
 
 void app_main(void)
 {
+    uint8_t base_mac[6];
+	// Get MAC address for WiFi station
+	esp_read_mac(base_mac, ESP_MAC_WIFI_STA);
+	sprintf(mac_address, "%02X:%02X:%02X:%02X:%02X:%02X", base_mac[0], base_mac[1], base_mac[2], base_mac[3], base_mac[4], base_mac[5]);
+
     audio_pipeline_handle_t pipeline;
     audio_element_handle_t i2s_stream_writer, flac_decoder;
     esp_log_level_set("*", ESP_LOG_WARN);
