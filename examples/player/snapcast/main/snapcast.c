@@ -21,6 +21,7 @@
 #include "lwip/sys.h"
 #include "lwip/netdb.h"
 #include "lwip/dns.h"
+#include "apps/sntp/sntp.h"
 
 #include "audio_element.h"
 #include "audio_pipeline.h"
@@ -33,6 +34,8 @@
 #include "raw_stream.h"
 
 #include "snapcast.h"
+
+#include <sys/time.h>
 
 /* The examples use simple WiFi configuration that you can set via
    'make menuconfig'.
@@ -112,11 +115,12 @@ static void initialise_wifi(void)
 static void http_get_task(void *pvParameters)
 {
     struct sockaddr_in servaddr;
-	char *start;
-	int sockfd;
-	char base_message_serialized[BASE_MESSAGE_SIZE];
-	char *hello_message_serialized;
-	int result, size;
+    char *start;
+    int sockfd;
+    char base_message_serialized[BASE_MESSAGE_SIZE];
+    char *hello_message_serialized;
+    int result, size;
+    struct timeval tv;
 
     while(1) {
         /* Wait for the callback to set the CONNECTED_BIT in the
@@ -126,9 +130,9 @@ static void http_get_task(void *pvParameters)
                             false, true, portMAX_DELAY);
         ESP_LOGI(TAG, "Connected to AP");
 
-		servaddr.sin_family = AF_INET;
-		servaddr.sin_addr.s_addr = inet_addr(HOST);
-		servaddr.sin_port = htons(PORT);
+        servaddr.sin_family = AF_INET;
+        servaddr.sin_addr.s_addr = inet_addr(HOST);
+        servaddr.sin_port = htons(PORT);
 
         sockfd = socket(AF_INET, SOCK_STREAM, 0);
         if(sockfd < 0) {
@@ -138,7 +142,7 @@ static void http_get_task(void *pvParameters)
         }
         ESP_LOGI(TAG, "... allocated socket");
 
-		if (connect(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) != 0) {
+        if (connect(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) != 0) {
             ESP_LOGE(TAG, "... socket connect failed errno=%d", errno);
             close(sockfd);
             vTaskDelay(4000 / portTICK_PERIOD_MS);
@@ -147,52 +151,58 @@ static void http_get_task(void *pvParameters)
 
         ESP_LOGI(TAG, "... connected");
 
-		codec_header_message_t codec_header_message;
-		wire_chunk_message_t wire_chunk_message;
+        codec_header_message_t codec_header_message;
+        wire_chunk_message_t wire_chunk_message;
 
-		bool received_header = false;
-		base_message_t base_message = {
-			SNAPCAST_MESSAGE_HELLO,
-			0x0,
-			0x0,
-			{ 0x5df65146, 0x0 },
-			{ 0x5df65146, 0x0 },
-			0x0,
-		};
+        result = gettimeofday(&tv, NULL);
+        if (result) {
+            ESP_LOGI(TAG, "Failed to gettimeofday\r\n");
+            return;
+        }
 
-		hello_message_t hello_message = {
-			mac_address,
-			"ESP32-Caster",
-			"0.0.0",
-			"libsnapcast",
-			"esp32",
-			"xtensa",
-			1,
-			mac_address,
-			2,
-		};
+        bool received_header = false;
+        base_message_t base_message = {
+            SNAPCAST_MESSAGE_HELLO,
+            0x0,
+            0x0,
+            { tv.tv_sec, tv.tv_usec },
+            { 0x0, 0x0 },
+            0x0,
+        };
 
-		hello_message_serialized = hello_message_serialize(&hello_message, (size_t*) &(base_message.size));
-		if (!hello_message_serialized) {
-			ESP_LOGI(TAG, "Failed to serialize hello message\r\b");
-			return;
-		}
+        hello_message_t hello_message = {
+            mac_address,
+            "ESP32-Caster",
+            "0.0.0",
+            "libsnapcast",
+            "esp32",
+            "xtensa",
+            1,
+            mac_address,
+            2,
+        };
 
-		result = base_message_serialize(
-			&base_message,
-			base_message_serialized,
-			BASE_MESSAGE_SIZE
-		);
-		if (result) {
-			ESP_LOGI(TAG, "Failed to serialize base message\r\n");
-			return;
-		}
+        hello_message_serialized = hello_message_serialize(&hello_message, (size_t*) &(base_message.size));
+        if (!hello_message_serialized) {
+            ESP_LOGI(TAG, "Failed to serialize hello message\r\b");
+            return;
+        }
 
-		write(sockfd, base_message_serialized, BASE_MESSAGE_SIZE);
-		write(sockfd, hello_message_serialized, base_message.size);
-		free(hello_message_serialized);
+        result = base_message_serialize(
+            &base_message,
+            base_message_serialized,
+            BASE_MESSAGE_SIZE
+        );
+        if (result) {
+            ESP_LOGI(TAG, "Failed to serialize base message\r\n");
+            return;
+        }
 
-		for (;;) {
+        write(sockfd, base_message_serialized, BASE_MESSAGE_SIZE);
+        write(sockfd, hello_message_serialized, base_message.size);
+        free(hello_message_serialized);
+
+        for (;;) {
             size = 0;
             while (size < BASE_MESSAGE_SIZE) {
                 result = read(sockfd, &(buff[size]), BASE_MESSAGE_SIZE - size);
@@ -204,12 +214,21 @@ static void http_get_task(void *pvParameters)
                 size += result;
             }
 
-			result = base_message_deserialize(&base_message, buff, size);
-			if (result) {
-				ESP_LOGI(TAG, "Failed to read base message: %d\r\n", result);
-				// TODO there should be a big circular buffer or something for this
-				return;
-			}
+            result = gettimeofday(&tv, NULL);
+            if (result) {
+                ESP_LOGI(TAG, "Failed to gettimeofday\r\n");
+                return;
+            }
+
+            result = base_message_deserialize(&base_message, buff, size);
+            if (result) {
+                ESP_LOGI(TAG, "Failed to read base message: %d\r\n", result);
+                // TODO there should be a big circular buffer or something for this
+                return;
+            }
+
+            base_message.received.sec = tv.tv_sec;
+            base_message.received.usec = tv.tv_usec;
 
             start = buff;
             size = 0;
@@ -222,18 +241,18 @@ static void http_get_task(void *pvParameters)
 
                 size += result;
             }
-			///print_buffer(start, size);
-			///ESP_LOGI(TAG, "\r\n");
+            ///print_buffer(start, size);
+            ///ESP_LOGI(TAG, "\r\n");
 
-			switch (base_message.type) {
-				case SNAPCAST_MESSAGE_CODEC_HEADER:
-					result = codec_header_message_deserialize(&codec_header_message, start, size);
-					if (result) {
-						ESP_LOGI(TAG, "Failed to read codec header: %d\r\n", result);
-						return;
-					}
+            switch (base_message.type) {
+                case SNAPCAST_MESSAGE_CODEC_HEADER:
+                    result = codec_header_message_deserialize(&codec_header_message, start, size);
+                    if (result) {
+                        ESP_LOGI(TAG, "Failed to read codec header: %d\r\n", result);
+                        return;
+                    }
 
-					//ESP_LOGI(TAG, "Received codec header message\r\n");
+                    //ESP_LOGI(TAG, "Received codec header message\r\n");
                     size = codec_header_message.size;
                     start = codec_header_message.payload;
 
@@ -243,22 +262,22 @@ static void http_get_task(void *pvParameters)
                         size -= result;
                     }
 
-					codec_header_message_free(&codec_header_message);
-					received_header = true;
-				break;
+                    codec_header_message_free(&codec_header_message);
+                    received_header = true;
+                break;
 
-				case SNAPCAST_MESSAGE_WIRE_CHUNK:
-					if (!received_header) {
-						continue;
-					}
+                case SNAPCAST_MESSAGE_WIRE_CHUNK:
+                    if (!received_header) {
+                        continue;
+                    }
 
-					result = wire_chunk_message_deserialize(&wire_chunk_message, start, size);
-					if (result) {
-						ESP_LOGI(TAG, "Failed to read wire chunk: %d\r\n", result);
-						return;
-					}
+                    result = wire_chunk_message_deserialize(&wire_chunk_message, start, size);
+                    if (result) {
+                        ESP_LOGI(TAG, "Failed to read wire chunk: %d\r\n", result);
+                        return;
+                    }
 
-					//ESP_LOGI(TAG, "Received wire message\r\n");
+                    //ESP_LOGI(TAG, "Received wire message\r\n");
                     size = wire_chunk_message.size;
                     start = wire_chunk_message.payload;
 
@@ -268,12 +287,12 @@ static void http_get_task(void *pvParameters)
                         size -= result;
                     }
 
-					wire_chunk_message_free(&wire_chunk_message);
-				break;
-			}
-		}
+                    wire_chunk_message_free(&wire_chunk_message);
+                break;
+            }
+        }
 
-		ESP_LOGI(TAG, "... done reading from socket\r\n");
+        ESP_LOGI(TAG, "... done reading from socket\r\n");
         close(sockfd);
         for(int countdown = 10; countdown >= 0; countdown--) {
             ESP_LOGI(TAG, "%d... ", countdown);
@@ -283,12 +302,40 @@ static void http_get_task(void *pvParameters)
     }
 }
 
+void set_time_from_sntp() {
+    xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT,
+                        false, true, portMAX_DELAY);
+    ESP_LOGI(TAG, "Initializing SNTP");
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    sntp_setservername(0, "pool.ntp.org");
+    sntp_init();
+
+    // wait for time to be set
+    time_t now = 0;
+    struct tm timeinfo = { 0 };
+    int retry = 0;
+    const int retry_count = 10;
+    while(timeinfo.tm_year < (2016 - 1900) && ++retry < retry_count) {
+        ESP_LOGI(TAG, "Waiting for system time to be set... (%d/%d)", retry, retry_count);
+        vTaskDelay(2000 / portTICK_PERIOD_MS);
+        time(&now);
+        localtime_r(&now, &timeinfo);
+    }
+
+    char strftime_buf[64];
+
+    // Set timezone to Eastern Standard Time and print local time
+    localtime_r(&now, &timeinfo);
+    strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
+    ESP_LOGI(TAG, "The current date/time in UTC is: %s", strftime_buf);
+}
+
 void app_main(void)
 {
     uint8_t base_mac[6];
-	// Get MAC address for WiFi station
-	esp_read_mac(base_mac, ESP_MAC_WIFI_STA);
-	sprintf(mac_address, "%02X:%02X:%02X:%02X:%02X:%02X", base_mac[0], base_mac[1], base_mac[2], base_mac[3], base_mac[4], base_mac[5]);
+    // Get MAC address for WiFi station
+    esp_read_mac(base_mac, ESP_MAC_WIFI_STA);
+    sprintf(mac_address, "%02X:%02X:%02X:%02X:%02X:%02X", base_mac[0], base_mac[1], base_mac[2], base_mac[3], base_mac[4], base_mac[5]);
 
     audio_pipeline_handle_t pipeline;
     audio_element_handle_t i2s_stream_writer, flac_decoder;
@@ -340,6 +387,7 @@ void app_main(void)
     audio_pipeline_run(pipeline);
 
     initialise_wifi();
+    set_time_from_sntp();
     xTaskCreatePinnedToCore(&http_get_task, "http_get_task", 4096, NULL, 5, NULL, 1);
 
     while (1) {
