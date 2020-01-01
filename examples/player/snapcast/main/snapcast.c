@@ -151,7 +151,7 @@ static void http_get_task(void *pvParameters)
 
 		bool received_header = false;
 		base_message_t base_message = {
-			hello,
+			SNAPCAST_MESSAGE_HELLO,
 			0x0,
 			0x0,
 			{ 0x5df65146, 0x0 },
@@ -225,7 +225,7 @@ static void http_get_task(void *pvParameters)
 			///ESP_LOGI(TAG, "\r\n");
 
 			switch (base_message.type) {
-				case codec_header:
+				case SNAPCAST_MESSAGE_CODEC_HEADER:
 					result = codec_header_message_deserialize(&codec_header_message, start, size);
 					if (result) {
 						ESP_LOGI(TAG, "Failed to read codec header: %d\r\n", result);
@@ -246,7 +246,7 @@ static void http_get_task(void *pvParameters)
 					received_header = true;
 				break;
 
-				case wire_chunk:
+				case SNAPCAST_MESSAGE_WIRE_CHUNK:
 					if (!received_header) {
 						continue;
 					}
