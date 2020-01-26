@@ -193,8 +193,14 @@ static void http_get_task(void *pvParameters)
     int sockfd;
     char base_message_serialized[BASE_MESSAGE_SIZE];
     char *hello_message_serialized;
-    int result, size;
-    struct timeval tv;
+    int result, size, id_counter;
+    struct timeval now, tv1, tv2, tv3, last_time_sync;
+    time_message_t time_message;
+    double time_diff;
+
+    last_time_sync.tv_sec = 0;
+    last_time_sync.tv_usec = 0;
+    id_counter = 0;
 
     while(1) {
         /* Wait for the callback to set the CONNECTED_BIT in the
@@ -229,7 +235,7 @@ static void http_get_task(void *pvParameters)
         wire_chunk_message_t wire_chunk_message;
         server_settings_message_t server_settings_message;
 
-        result = gettimeofday(&tv, NULL);
+        result = gettimeofday(&now, NULL);
         if (result) {
             ESP_LOGI(TAG, "Failed to gettimeofday\r\n");
             return;
@@ -240,7 +246,7 @@ static void http_get_task(void *pvParameters)
             SNAPCAST_MESSAGE_HELLO,
             0x0,
             0x0,
-            { tv.tv_sec, tv.tv_usec },
+            { now.tv_sec, now.tv_usec },
             { 0x0, 0x0 },
             0x0,
         };
@@ -289,7 +295,7 @@ static void http_get_task(void *pvParameters)
                 size += result;
             }
 
-            result = gettimeofday(&tv, NULL);
+            result = gettimeofday(&now, NULL);
             if (result) {
                 ESP_LOGI(TAG, "Failed to gettimeofday\r\n");
                 return;
@@ -302,8 +308,8 @@ static void http_get_task(void *pvParameters)
                 return;
             }
 
-            base_message.received.sec = tv.tv_sec;
-            base_message.received.usec = tv.tv_usec;
+            base_message.received.sec = now.tv_sec;
+            base_message.received.usec = now.tv_usec;
 
             start = buff;
             size = 0;
@@ -380,6 +386,74 @@ static void http_get_task(void *pvParameters)
                     ESP_LOGI(TAG, "Setting volume: %d", server_settings_message.volume);
                     current_volume = server_settings_message.volume / 100.0;
                 break;
+
+                case SNAPCAST_MESSAGE_TIME:
+                    result = time_message_deserialize(&time_message, start, size);
+                    if (result) {
+                        ESP_LOGI(TAG, "Failed to deserialize time message\r\n");
+                        return;
+                    }
+
+                    // tv == server to client latency (s2c)
+                    // time_message.latency == client to server latency(c2s)
+                    // TODO the fact that I have to do this simple conversion means
+                    // I should probably use the timeval struct instead of my own
+                    tv1.tv_sec = base_message.received.sec;
+                    tv1.tv_usec = base_message.received.usec;
+                    tv3.tv_sec = base_message.sent.sec;
+                    tv3.tv_usec = base_message.sent.usec;
+                    timersub(&tv1, &tv3, &tv2);
+                    tv1.tv_sec = time_message.latency.sec;
+                    tv1.tv_usec = time_message.latency.usec;
+
+                    // tv1 == c2s: client to server
+                    // tv2 == s2c: server to client
+                    //ESP_LOGI(TAG, "c2s: %ld %ld\r\n", tv1.tv_sec, tv1.tv_usec);
+                    //ESP_LOGI(TAG, "s2c: %ld %ld\r\n", tv2.tv_sec, tv2.tv_usec);
+                    time_diff = (((double)(tv1.tv_sec - tv2.tv_sec) / 2) * 1000) + (((double)(tv1.tv_usec - tv2.tv_usec) / 2) / 1000);
+                    ESP_LOGI(TAG, "Current latency: %fms\r\n", time_diff);
+                break;
+            }
+
+            // If it's been a second or longer since our last time message was
+            // sent, do so now
+            result = gettimeofday(&now, NULL);
+            if (result) {
+                ESP_LOGI(TAG, "Failed to gettimeofday\r\n");
+                return;
+            }
+            timersub(&now, &last_time_sync, &tv1);
+            if (tv1.tv_sec >= 1) {
+                last_time_sync.tv_sec = now.tv_sec;
+                last_time_sync.tv_usec = now.tv_usec;
+
+                base_message.type = SNAPCAST_MESSAGE_TIME;
+                base_message.id = id_counter++;
+                base_message.refersTo = 0;
+                base_message.received.sec = 0;
+                base_message.received.usec = 0;
+                base_message.sent.sec = now.tv_sec;
+                base_message.sent.usec = now.tv_usec;
+                base_message.size = TIME_MESSAGE_SIZE;
+
+                result = base_message_serialize(
+                    &base_message,
+                    base_message_serialized,
+                    BASE_MESSAGE_SIZE
+                );
+                if (result) {
+                    ESP_LOGE(TAG, "Failed to serialize base message for time\r\n");
+                    continue;
+                }
+
+                result = time_message_serialize(&time_message, buff, BUFF_LEN);
+                if (result) {
+                    ESP_LOGI(TAG, "Failed to serialize time message\r\b");
+                    continue;
+                }
+
+                write(sockfd, base_message_serialized, BASE_MESSAGE_SIZE);
+                write(sockfd, buff, TIME_MESSAGE_SIZE);
             }
         }
 
